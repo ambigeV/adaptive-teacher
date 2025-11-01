@@ -139,7 +139,7 @@ class DeceptiveGridWorld:
 
 if __name__ == "__main__":
     env = DeceptiveGridWorld(horizon=16, ndim=8, beta=1.0)
-    actions = [0, 1, 0, 1, 0, 1, 0, 1]
+    actions = [0, 1, 0, 4, 0, 8, 0, 8]
     _obs, _r, _d, _s = env.reset()
     for a in actions:
         _obs, _r, _d, _s = env.step(a)

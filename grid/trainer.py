@@ -8,6 +8,7 @@ import sys
 sys.path.append("..")
 
 from grid.local_search import back_and_forth
+from grid.qd_search import QDArchive, qd_back_and_forth
 
 from typing import Callable, Dict, Optional
 import itertools
@@ -52,6 +53,9 @@ class Trainer:
         eval_num_empirical_loss: int = 100000,
         eval_batch_size: int = 1000,
         plot: bool = False,
+        qd_on: bool = False,
+        qd_frac: float = 0.25,
+        bd_bins: int = 4,
     ) -> None:
         self.env = env
         self.env.get_true_density()  # precompute true density
@@ -113,6 +117,12 @@ class Trainer:
         self.eval_batch_size = eval_batch_size
         self.plot = plot
 
+        # QD state
+        self.qd_on = qd_on
+        self.qd_frac = qd_frac
+        self.bd_bins = bd_bins
+        self.qd_archive = QDArchive(bins_per_dim=self.bd_bins) if self.qd_on else None
+
     def train(self) -> None:
         # Plot the target distribution
         _, true_density, _, _ = self.env.get_true_density()
@@ -166,6 +176,33 @@ class Trainer:
                 if i % 2 == 0 or self.buffer is None:  # onpolicy
                     _batch, _visited = self.agent.sample_many(self.batch_size)
                     n_reward_calls += self.batch_size
+
+                     # === QD CHANGE: archive on-policy terminals immediately (k=1 per cell) ===
+                    if self.qd_on and self.qd_archive is not None:
+                        for traj, sT in zip(_batch, _visited):
+                            R = traj[3]
+                            if isinstance(R, torch.Tensor):
+                                R = float(R.item()) if R.ndim == 0 else float(R.sum().item())
+                            self.qd_archive.add(np.array(sT, dtype=np.int32), R, self.env.horizon)
+
+                    # === QD CHANGE: QD back-and-forth augmentation (mirrors LS hook/contract) ===
+                    if (i // 2) % 8 == 7 and self.qd_on and self.qd_archive is not None and self.qd_archive.coverage() > 0:
+                        # Use same cadence knobs as LS: ls_back_ratio, ls_iter; draw ~qd_frac*batch elites each iter
+                        qd_cells = max(1, int(self.batch_size * self.qd_frac))
+                        _batch, _visited_qd, n_new_rewards = qd_back_and_forth(
+                            self.agent,
+                            _batch,
+                            self.qd_archive,
+                            ls_back_ratio=self.ls_back_ratio,
+                            iterations=self.ls_iter,
+                            qd_cells_per_iter=qd_cells,
+                            mutation_prob=0.15,
+                            crossover_prob=0.7,
+                            eps_noisy=False,
+                        )
+                        _visited = _visited + _visited_qd
+                        n_reward_calls += n_new_rewards  # count env terminal rewards like LS
+
                     if self.ls and (i // 2) % 8 == 7:  # local search
                         _batch, _visited = back_and_forth(
                             self.agent, _batch, self.ls_back_ratio, self.ls_iter, eps_noisy=False
@@ -278,17 +315,20 @@ class Trainer:
                 print(f"n_goals_found: {n_goals_found}/{len(self.goal_found_map)}")
 
                 if self.logging_fn is not None:
-                    self.logging_fn(
-                        {
-                            "loss": np.mean(losses[-100:]),
-                            "empirical_l1": l1,
-                            "empirical_w_l1": w_l1,
-                            "n_goals_found": n_goals_found,
-                            "n_reward_calls": n_reward_calls,
-                            "n_grad_steps": n_grad_steps,
-                        },
-                        step=i,
-                    )
+                    log_dict = {
+                        "loss": np.mean(losses[-100:]),
+                        "empirical_l1": l1,
+                        "empirical_w_l1": w_l1,
+                        "n_goals_found": n_goals_found,
+                        "n_reward_calls": n_reward_calls,
+                        "n_grad_steps": n_grad_steps,
+                    }
+                    # === QD CHANGE: log QD metrics if enabled ===
+                    if self.qd_on and self.qd_archive is not None:
+                        log_dict["qd_coverage"] = self.qd_archive.coverage()
+                        # optional QD score (sum best per cell) — cheap to add if you want:
+                        # log_dict["qd_score"] = sum(e["reward"] for e in self.qd_archive.store.values())
+                    self.logging_fn(log_dict, step=i)
 
                 # Sampling and Evaluation
                 self.agent.eval()
@@ -393,6 +433,12 @@ if __name__ == "__main__":
     # Back&Forth Local Search
     parser.add_argument("--ls", action="store_true", default=False)
     parser.add_argument("--ls_back_ratio", type=float, default=0.5)
+
+    # === QD CHANGE: CLI for QD option (TB-only) ===
+    parser.add_argument("--qd_on", action="store_true", help="Enable QD back-and-forth for TB agent")
+    parser.add_argument("--qd_frac", type=float, default=0.25, help="Fraction of batch to draw as QD elites per iter")
+    parser.add_argument("--bd_bins", type=int, default=4, help="Bins per dimension for BD cells")
+
 
     # Evaluation
     parser.add_argument("--eval_num_empirical_loss", type=int, default=100000)
@@ -516,6 +562,10 @@ if __name__ == "__main__":
         },
         "n_logs": args.n_logs,
         "run_name": args.run_name,
+        # === QD CHANGE: pass QD knobs into Trainer ===
+        "qd_on": args.qd_on,
+        "qd_frac": args.qd_frac,
+        "bd_bins": args.bd_bins,
     }
 
     logging_fn = None
@@ -525,7 +575,7 @@ if __name__ == "__main__":
         wandb.init(
             project=f"TeacherGFN-Grid",
             name=f"{args.agent}{'_'+args.run_name if args.run_name else ''}",
-            tags=[args.agent, f"h{args.horizon}ndim{args.ndim}"],
+            tags=[args.agent, f"h{args.horizon}ndim{args.ndim}name{args.run_name}"],
             settings=wandb.Settings(init_timeout=300),
         )
         for config in [env_params, agent_common_params, agent_param, trainer_params]:
