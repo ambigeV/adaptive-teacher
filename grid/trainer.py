@@ -8,7 +8,7 @@ import sys
 sys.path.append("..")
 
 from grid.local_search import back_and_forth
-from grid.qd_search import QDArchive, qd_back_and_forth
+from grid.qd_search import QDArchive, qd_back_and_forth, qd_back_and_forth_refined_from_start
 
 from typing import Callable, Dict, Optional
 import itertools
@@ -189,11 +189,11 @@ class Trainer:
                     if (i // 2) % 8 == 7 and self.qd_on and self.qd_archive is not None and self.qd_archive.coverage() > 0:
                         # Use same cadence knobs as LS: ls_back_ratio, ls_iter; draw ~qd_frac*batch elites each iter
                         qd_cells = max(1, int(self.batch_size * self.qd_frac))
-                        _batch, _visited_qd, n_new_rewards = qd_back_and_forth(
+                        _batch, _visited_qd, n_new_rewards = qd_back_and_forth_refined_from_start(
                             self.agent,
                             _batch,
                             self.qd_archive,
-                            ls_back_ratio=self.ls_back_ratio,
+                            # ls_back_ratio=self.ls_back_ratio,
                             iterations=self.ls_iter,
                             qd_cells_per_iter=qd_cells,
                             mutation_prob=0.15,
